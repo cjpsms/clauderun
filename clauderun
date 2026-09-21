@@ -1,0 +1,692 @@
+#!/usr/bin/env python3
+"""clauderun — type a shell command badly (typos, or plain language in any language) and
+Claude Haiku turns it into the real command, which you see and confirm before it runs.
+
+    clauderun gti stauts                        # typo            -> git status
+    clauderun "list files sorted by size"      # plain language  -> ls -lS
+    clauderun "หาว่า port 4002 ใครใช้อยู่"      # Thai works too   -> ss -ltnp | grep 4002
+
+Flow:
+  1. gather context: OS, shell, cwd, top-level files, git branch, which tools exist here
+  2. ask Claude Haiku for {command, kind, explain, danger, needs_sudo, notes} as JSON
+  3. check every program the command calls actually exists (else point at claudeinstall)
+  4. run our OWN danger classifier on top of the model's — the higher tier wins
+  5. show the command; safe/modifies -> y/N/e (e = edit), destructive -> must type "yes"
+  6. run it via `bash -c` in the current dir; if it fails, send stderr back once for a fix
+
+Backends: the `claude` CLI (default, uses your Claude subscription, no API key) or the
+Anthropic SDK when ANTHROPIC_API_KEY is set / --backend api is given.
+"""
+from __future__ import annotations
+
+import argparse
+import hashlib
+import json
+import os
+import platform
+import re
+import shlex
+import shutil
+import subprocess
+import sys
+import threading
+from pathlib import Path
+
+VERSION = "0.1.0"
+CACHE_DIR = Path(os.environ.get("XDG_CACHE_HOME", Path.home() / ".cache")) / "clauderun"
+DEFAULT_MODEL_CLI = "haiku"            # alias understood by the claude CLI
+DEFAULT_MODEL_API = "claude-haiku-4-5"  # exact API model id
+MAX_RETRIES = 2                         # fix-after-failure rounds
+LS_LIMIT = 30                           # top-level entries shown to the model
+STDERR_TAIL = 20                        # stderr lines sent back on failure
+
+TIERS = ["safe", "modifies", "destructive"]
+
+# tools whose presence/absence the model most often gets wrong — always reported
+COMMON_TOOLS = [
+    "eza", "exa", "lsd", "bat", "fd", "rg", "fzf", "jq", "yq", "htop", "btop", "nvtop",
+    "nvim", "vim", "docker", "podman", "systemctl", "ss", "lsof", "ip", "curl", "wget",
+    "python3", "node", "npm", "cargo", "go", "gcc", "make", "git", "gh", "tmux",
+    "pacman", "yay", "paru", "apt", "dnf", "brew", "flatpak", "snap",
+    "wl-copy", "xclip", "notify-send", "ffmpeg", "convert", "magick", "tar", "unzip", "zip",
+]
+
+# bash builtins/keywords that are not binaries in PATH
+BUILTINS = {
+    "cd", "echo", "export", "source", ".", "test", "[", "[[", "set", "unset", "alias", "unalias",
+    "type", "command", "builtin", "exec", "eval", "true", "false", "read", "printf", "pwd", "kill",
+    "wait", "jobs", "fg", "bg", "ulimit", "time", "shift", "return", "exit", "break", "continue",
+    "for", "while", "until", "do", "done", "if", "then", "else", "elif", "fi", "case", "esac",
+    "in", "function", "select", "{", "}", "(", ")", "!", "local", "declare", "typeset", "readonly",
+    "let", "trap", "umask", "hash", "help", "history", "pushd", "popd", "dirs", "getopts", "mapfile",
+}
+
+# ---------------------------------------------------------------------------
+# our own danger classifier — runs on the final command text, independent of the model
+# ---------------------------------------------------------------------------
+DESTRUCTIVE = [
+    r"\brm\s+(-\w*\s+)*-\w*[rRf]",                          # rm -r / rm -f (any flag order)
+    r"\brm\s+(\S+\s+)*(/|~|\$HOME|\*|\.\.?)/?(\s|$)",        # rm of /, ~, *, . or ..
+    r"\b(dd|mkfs(\.\w+)?|shred|wipefs|fdisk|sfdisk|parted|cfdisk)\b",
+    r">\s*/dev/(sd|nvme|hd|mmcblk|vd|disk)",
+    r"\b(chmod|chown|chgrp)\b.*\s-\w*R\w*\b.*\s(/|~|\$HOME)/?(\s|$)",
+    r"\bgit\s+push\b.*(\s--force\b|\s-f\b|\s\+\w)",
+    r"\bgit\s+(reset\s+--hard|clean\s+-\w*[fdx]|branch\s+-D|stash\s+(drop|clear)|filter-branch|checkout\s+--\s)",
+    r"\btruncate\b", r":\(\)\s*\{", r"\bfork\s*bomb",
+    r"\bfind\b.*\s(-delete\b|-exec\s+rm\b)", r"\bxargs\b.*\brm\b",
+    r"\b(curl|wget)\b.*\|\s*(sudo\s+)?(ba|z|da|fi)?sh\b",   # curl | sh
+    r"\b(pkill|killall)\b", r"\bkill\s+(-9|-KILL|-SIGKILL)\b",
+    r"\bsystemctl\s+(stop|disable|mask|poweroff|reboot|halt|kill)\b",
+    r"(^|[;&|]\s*)(sudo\s+)?(reboot|poweroff|shutdown|halt|init\s+[06])\b",
+    r"\bcrontab\s+-r\b", r"\bhistory\s+-c\b",
+    r"\b(mv|cp)\b.*\s(/|~|\$HOME)/?(\s|$)",                  # mv something onto / or ~
+    r"\b(iptables|nft|ufw)\b.*\b(-F|flush|reset|disable)\b",
+]
+MODIFIES = [
+    r"\b(mv|cp|mkdir|rmdir|touch|tee|ln|rm|kill|chmod|chown|chgrp|sed\s+-\w*i|patch|install)\b",
+    r"\b(pacman|yay|paru|apt(-get)?|dnf|yum|zypper|apk|brew|flatpak|snap|pip3?|pipx|npm|cargo|go)\s+(install|remove|uninstall|-S|-R|add|del|upgrade|update|-Syu?)\b",
+    r"\bgit\s+(commit|push|pull|fetch|merge|rebase|add|rm|mv|checkout|switch|stash|tag|cherry-pick|revert|init|clone)\b",
+    r"\bsystemctl\s+(start|restart|reload|enable|daemon-reload)\b",
+    r"\b(docker|podman)\s+(run|rm|rmi|stop|kill|prune|build|push|pull|compose)\b",
+    r"\b(make|cmake|ninja|cargo\s+build|npm\s+run|pip\s+install)\b",
+    r"\b(curl|wget)\b.*\s(-o|-O|--output|--remote-name|--output-document)\b", r"\bwget\b",
+    r"\bsudo\b", r"\bcrontab\b", r"\bsetfacl\b", r"\bxdotool\b", r"\bwl-copy\b|\bxclip\b",
+]
+REDIRECT = re.compile(r"(?<![<>])(?:\d|&)?(>>?)\s*([^\s>&|;]+)")   # `>` / `>>` with a file target
+
+
+class Ansi:
+    on = sys.stdout.isatty() and os.environ.get("NO_COLOR") is None
+    @classmethod
+    def c(cls, code: str, s: str) -> str:
+        return f"\033[{code}m{s}\033[0m" if cls.on else s
+    @classmethod
+    def bold(cls, s): return cls.c("1", s)
+    @classmethod
+    def dim(cls, s): return cls.c("2", s)
+    @classmethod
+    def green(cls, s): return cls.c("32", s)
+    @classmethod
+    def yellow(cls, s): return cls.c("33", s)
+    @classmethod
+    def red(cls, s): return cls.c("31", s)
+    @classmethod
+    def cyan(cls, s): return cls.c("36", s)
+
+
+def info(msg: str) -> None:
+    print(Ansi.cyan("::"), msg, flush=True)
+
+def warn(msg: str) -> None:
+    print(Ansi.yellow("!!"), msg, file=sys.stderr, flush=True)
+
+def die(msg: str, code: int = 1) -> None:
+    print(Ansi.red("error:"), msg, file=sys.stderr)
+    sys.exit(code)
+
+
+# ---------------------------------------------------------------------------
+# context: what the model needs to know about THIS machine and THIS directory
+# ---------------------------------------------------------------------------
+def detect_os() -> dict:
+    d = {"system": platform.system(), "id": "", "pretty": platform.platform()}
+    if d["system"] == "Darwin":
+        d["id"] = "macos"
+        d["pretty"] = f"macOS {platform.mac_ver()[0]}"
+        return d
+    try:
+        kv = {}
+        for line in Path("/etc/os-release").read_text().splitlines():
+            if "=" in line:
+                k, v = line.split("=", 1)
+                kv[k] = v.strip().strip('"')
+        d["id"] = kv.get("ID", "linux")
+        d["pretty"] = kv.get("PRETTY_NAME", d["id"])
+    except OSError:
+        d["id"] = "linux"
+    return d
+
+
+def git_branch(cwd: Path) -> str | None:
+    if not shutil.which("git"):
+        return None
+    try:
+        r = subprocess.run(["git", "-C", str(cwd), "rev-parse", "--abbrev-ref", "HEAD"],
+                           capture_output=True, text=True, timeout=5)
+        return r.stdout.strip() if r.returncode == 0 else None
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+
+
+def list_dir(cwd: Path) -> tuple[list[str], int]:
+    try:
+        names = sorted(os.listdir(cwd), key=str.lower)
+    except OSError:
+        return [], 0
+    shown = [n + ("/" if (cwd / n).is_dir() else "") for n in names[:LS_LIMIT]]
+    return shown, len(names)
+
+
+def words_in(query: str) -> list[str]:
+    # candidate program names the user typed (ascii words only; Thai/prose words won't be in PATH anyway)
+    return sorted({w for w in re.findall(r"[A-Za-z][A-Za-z0-9_.+-]{1,}", query) if len(w) <= 30})
+
+
+def build_context(osd: dict, query: str) -> dict:
+    cwd = Path.cwd()
+    entries, total = list_dir(cwd)
+    mentioned = words_in(query)
+    present = [t for t in COMMON_TOOLS if shutil.which(t)]
+    for w in mentioned:
+        if w not in present and shutil.which(w):
+            present.append(w)
+    missing = [w for w in mentioned if w.lower() in COMMON_TOOLS and not shutil.which(w)]
+    return {
+        "os": osd["pretty"],
+        "shell": os.path.basename(os.environ.get("SHELL", "bash")),
+        "user": os.environ.get("USER", ""),
+        "cwd": str(cwd),
+        "home": str(Path.home()),
+        "git_branch": git_branch(cwd),
+        "entries": entries,
+        "entries_total": total,
+        "present": present,
+        "missing": missing,
+        "sudo_askpass": bool(os.environ.get("SUDO_ASKPASS")),
+    }
+
+
+# ---------------------------------------------------------------------------
+# the model
+# ---------------------------------------------------------------------------
+SCHEMA = {
+    "type": "object",
+    "properties": {
+        "command": {"type": "string"},
+        "kind": {"type": "string", "enum": ["typo", "translate"]},
+        "explain": {"type": "string"},
+        "danger": {"type": "string", "enum": TIERS},
+        "needs_sudo": {"type": "boolean"},
+        "notes": {"type": "string"},
+    },
+    "required": ["command", "kind", "explain", "danger", "needs_sudo", "notes"],
+    "additionalProperties": False,
+}
+
+
+def system_prompt(ctx: dict) -> str:
+    entries = " ".join(ctx["entries"]) or "(empty)"
+    more = f" … (+{ctx['entries_total'] - len(ctx['entries'])} more)" if ctx["entries_total"] > len(ctx["entries"]) else ""
+    branch = f" (git branch: {ctx['git_branch']})" if ctx["git_branch"] else " (not a git repo)"
+    missing = f"\n  Mentioned but NOT installed: {', '.join(ctx['missing'])}" if ctx["missing"] else ""
+    return f"""You are clauderun, a command resolver for a terminal. The user typed either a shell command with mistakes (typos, wrong flag order, half-remembered names) or a plain-language description of what they want, in any language (often Thai or English). Answer with the ONE real bash command line that does it on THIS machine.
+
+Machine:
+  OS: {ctx['os']}, shell: {ctx['shell']}, user: {ctx['user']}, home: {ctx['home']}
+  cwd: {ctx['cwd']}{branch}
+  top-level entries in cwd: {entries}{more}
+  Tools present: {', '.join(ctx['present'])}{missing}
+
+Rules:
+- Return ONLY a JSON object matching this schema, no prose, no markdown fences:
+  {{"command": "<one bash command line, or empty string if impossible>",
+    "kind": "typo" | "translate",
+    "explain": "<one short line saying what the command does — in the language the request was written in; English if the request was just a command>",
+    "danger": "safe" | "modifies" | "destructive",
+    "needs_sudo": bool,
+    "notes": "<caveat or empty string>"}}
+- command: a single bash line. Pipes, &&, redirects and globs are fine when needed; keep it as simple as possible. Prefer tools listed as present. Use only real, well-known flags — if unsure a flag exists, use the plain form instead.
+- If the task needs a tool that is NOT installed, write the command with that tool anyway and say so in notes. Do NOT add an install step (no pacman/apt/yay in the command) — the wrapper tells the user how to install it.
+- NEVER write `sudo` in the command; set needs_sudo=true instead and the wrapper adds it.
+- NEVER produce `curl ... | sh`, `eval` of remote content, or anything that fetches and executes code.
+- kind: "typo" when the input is essentially a real command with spelling/ordering mistakes (the fix does not depend on which files are in cwd). Otherwise "translate".
+- danger: "safe" = only reads/prints; "modifies" = creates or changes files, installs packages, git commits, starts services, sends network writes; "destructive" = deletes or overwrites data, force-push, reset --hard, disk/partition operations, kills processes, shutdown/reboot, anything not easily undone. When in doubt pick the higher tier.
+- If the user refers to "this file", "the video", etc., pick the matching entry from cwd. If several could match, pick the most likely and say so in notes.
+- If the request is not something a shell command can do, or is too ambiguous, set command to "" and explain why in notes."""
+
+
+def strip_fences(text: str) -> str:
+    t = text.strip()
+    if t.startswith("```"):
+        t = re.sub(r"^```[a-zA-Z]*\s*", "", t)
+        t = re.sub(r"\s*```$", "", t)
+    m = re.search(r"\{.*\}", t, re.S)
+    return m.group(0) if m else t
+
+
+def ask_cli(sys_prompt: str, query: str, model: str, verbose: bool) -> dict:
+    if not shutil.which("claude"):
+        die("`claude` CLI not found. Install Claude Code (https://claude.com/claude-code) or use --backend api with ANTHROPIC_API_KEY.")
+    cmd = [
+        "claude", "-p", "--model", model,
+        "--tools", "",                      # pure text answer, no tool use
+        "--setting-sources", "",            # ignore user/project settings (keeps the prompt tiny)
+        "--strict-mcp-config",              # no MCP servers
+        "--disable-slash-commands",
+        "--no-session-persistence",
+        "--output-format", "json",
+        "--system-prompt", sys_prompt,
+        query,
+    ]
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=120, cwd=str(Path.home()))
+    except subprocess.TimeoutExpired:
+        die("claude CLI timed out after 120s")
+    if r.returncode != 0:
+        die(f"claude CLI failed (rc={r.returncode}): {(r.stderr or r.stdout).strip()[:500]}")
+    try:
+        env = json.loads(r.stdout)
+    except json.JSONDecodeError:
+        die(f"unexpected claude CLI output: {r.stdout[:300]}")
+    if env.get("is_error"):
+        die(f"claude CLI error: {env.get('result')}")
+    if verbose:
+        u = env.get("usage", {})
+        info(f"claude: {u.get('input_tokens', '?')} in / {u.get('output_tokens', '?')} out tokens, {env.get('duration_api_ms', '?')} ms")
+    return json.loads(strip_fences(env.get("result", "")))
+
+
+def ask_api(sys_prompt: str, query: str, model: str, verbose: bool) -> dict:
+    try:
+        import anthropic  # type: ignore
+    except ImportError:
+        die("python package `anthropic` not installed (pip install anthropic), or use --backend cli")
+    client = anthropic.Anthropic()
+    try:
+        resp = client.messages.create(
+            model=model,
+            max_tokens=1024,
+            system=sys_prompt,
+            messages=[{"role": "user", "content": query}],
+            output_config={"format": {"type": "json_schema", "schema": SCHEMA}},
+        )
+    except anthropic.AuthenticationError:
+        die("Anthropic API: invalid or missing API key (set ANTHROPIC_API_KEY)")
+    except anthropic.RateLimitError:
+        die("Anthropic API: rate limited, try again in a minute")
+    except anthropic.APIStatusError as e:
+        die(f"Anthropic API error {e.status_code}: {e.message}")
+    except anthropic.APIConnectionError:
+        die("Anthropic API: network error")
+    if resp.stop_reason == "refusal":
+        die("Anthropic API: request was refused")
+    text = next(b.text for b in resp.content if b.type == "text")
+    if verbose:
+        info(f"claude: {resp.usage.input_tokens} in / {resp.usage.output_tokens} out tokens")
+    return json.loads(strip_fences(text))
+
+
+def ask(backend: str, sp: str, query: str, model: str, verbose: bool) -> dict:
+    try:
+        data = ask_api(sp, query, model, verbose) if backend == "api" else ask_cli(sp, query, model, verbose)
+    except (json.JSONDecodeError, ValueError) as e:
+        die(f"could not parse Claude's answer as JSON: {e}")
+    if not isinstance(data, dict):
+        die("Claude's answer was not a JSON object")
+    data.setdefault("command", "")
+    data.setdefault("kind", "translate")
+    data.setdefault("explain", "")
+    data.setdefault("danger", "modifies")
+    data.setdefault("needs_sudo", False)
+    data.setdefault("notes", "")
+    if data["danger"] not in TIERS:
+        data["danger"] = "modifies"
+    return data
+
+
+# ---------------------------------------------------------------------------
+# cache — only typo fixes (they don't depend on cwd); translated commands do
+# ---------------------------------------------------------------------------
+def cache_key(osd: dict, query: str) -> Path:
+    h = hashlib.sha256(f"{osd['id']}|{query.strip().lower()}".encode()).hexdigest()[:24]
+    return CACHE_DIR / f"{h}.json"
+
+
+def cache_get(path: Path) -> dict | None:
+    try:
+        return json.loads(path.read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+
+
+def cache_put(path: Path, data: dict) -> None:
+    try:
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(data, indent=1, ensure_ascii=False))
+    except OSError:
+        pass
+
+
+# ---------------------------------------------------------------------------
+# checks on the command text
+# ---------------------------------------------------------------------------
+def split_segments(command: str) -> list[list[str]] | None:
+    """shlex-tokenize and split on | || && ; — returns None if it doesn't parse."""
+    try:
+        toks = shlex.split(command, comments=False, posix=True)
+    except ValueError:
+        return None
+    segs: list[list[str]] = [[]]
+    for t in toks:
+        if t in ("|", "||", "&&", ";", "&"):
+            segs.append([])
+        elif t.endswith(";") and len(t) > 1:
+            segs[-1].append(t[:-1]); segs.append([])
+        else:
+            segs[-1].append(t)
+    return [s for s in segs if s]
+
+
+def strip_sudo(command: str) -> tuple[str, bool]:
+    """Remove any `sudo` the model wrote (we add it ourselves); report whether it was there."""
+    new, n = re.subn(r"(^|[;&|]\s*)sudo\s+(-\w+\s+)*", r"\1", command)
+    return new.strip(), n > 0
+
+
+def programs_in(command: str) -> tuple[list[str], list[str]] | None:
+    """(present, missing) program names the command calls, or None if unparseable."""
+    segs = split_segments(command)
+    if segs is None:
+        return None
+    present, missing = [], []
+    for seg in segs:
+        toks = [t for t in seg if not re.fullmatch(r"[A-Za-z_]\w*=.*", t)]  # skip VAR=val prefixes
+        if not toks:
+            continue
+        prog = toks[0]
+        while prog in ("sudo", "time", "nohup", "nice", "env", "command", "exec", "xargs", "watch") and len(toks) > 1:
+            toks = toks[1:]
+            while toks and toks[0].startswith("-"):   # the wrapper's own flags
+                toks = toks[1:]
+            if not toks:
+                break
+            prog = toks[0]
+        if not toks:
+            continue
+        if prog in BUILTINS or prog.startswith(("$", "(", "{", "!")) or prog.endswith(("=",)):
+            continue
+        name = os.path.basename(prog)
+        if "/" in prog:
+            (present if os.access(prog, os.X_OK) else missing).append(prog)
+        else:
+            (present if shutil.which(name) else missing).append(name)
+    return present, missing
+
+
+def classify(command: str) -> tuple[str, list[str]]:
+    """Our own danger tier for the command text, plus the reasons."""
+    reasons = []
+    tier = "safe"
+    for pat in DESTRUCTIVE:
+        if re.search(pat, command):
+            tier = "destructive"
+            reasons.append(f"matches destructive pattern `{pat}`")
+            break
+    if tier == "safe":
+        for pat in MODIFIES:
+            if re.search(pat, command):
+                tier = "modifies"
+                break
+    # `>` onto a file that already exists = overwrite = destructive; any other redirect = modifies
+    for m in REDIRECT.finditer(command):
+        op, target = m.group(1), os.path.expanduser(m.group(2).strip("'\""))
+        if target.startswith("/dev/") or target.startswith("/proc/"):
+            continue
+        if op == ">" and os.path.exists(target):
+            tier = "destructive"
+            reasons.append(f"`>` would overwrite existing file {target}")
+        else:
+            tier = max(tier, "modifies", key=TIERS.index)
+    return tier, reasons
+
+
+# ---------------------------------------------------------------------------
+# UI
+# ---------------------------------------------------------------------------
+def show_plan(command: str, explain: str, tier: str, reasons: list[str], notes: str,
+              needs_sudo: bool, missing: list[str], kind: str, source: str) -> None:
+    color = {"safe": Ansi.green, "modifies": Ansi.yellow, "destructive": Ansi.red}[tier]
+    shown = ("sudo -A " if needs_sudo and os.environ.get("SUDO_ASKPASS") else "sudo " if needs_sudo else "") + command
+    print()
+    print(f"  {Ansi.bold('command')}  {Ansi.cyan(shown)}")
+    if explain:
+        print(f"  {Ansi.bold('does')}     {explain}")
+    tag = f"{kind}" + (f", {source}" if source else "")
+    print(f"  {Ansi.bold('danger')}   {color(tier)}  {Ansi.dim('(' + tag + ')')}")
+    for r in reasons:
+        print(f"           {Ansi.dim(r)}")
+    if notes:
+        print(f"  {Ansi.bold('note')}     {notes}")
+    for m in missing:
+        print(f"  {Ansi.red('missing')}  `{m}` is not installed here — try: {Ansi.cyan('claudeinstall ' + m)}")
+    print()
+
+
+def read_line(prompt: str) -> str | None:
+    try:
+        return input(prompt)
+    except (EOFError, KeyboardInterrupt):
+        print()
+        return None
+
+
+def edit_line(command: str) -> str | None:
+    try:
+        import readline  # noqa: F401
+        readline.set_startup_hook(lambda: readline.insert_text(command))
+        try:
+            new = read_line(f"{Ansi.bold('edit')}  ")
+        finally:
+            readline.set_startup_hook()
+    except ImportError:
+        print(Ansi.dim(f"  (no readline; current: {command})"))
+        new = read_line(f"{Ansi.bold('edit')}  ")
+    return new.strip() if new is not None and new.strip() else None
+
+
+def confirm(tier: str, yes: bool) -> str:
+    """Returns 'run', 'edit' or 'abort'."""
+    if tier == "destructive":
+        if yes:
+            warn("-y is ignored for destructive commands")
+        if not sys.stdin.isatty():
+            warn("stdin is not a terminal; refusing to run a destructive command")
+            return "abort"
+        ans = read_line(f"{Ansi.red('DESTRUCTIVE')} — type {Ansi.bold('yes')} to run, {Ansi.bold('e')} to edit: ")
+        if ans is None:
+            return "abort"
+        a = ans.strip().lower()
+        return "run" if a == "yes" else "edit" if a == "e" else "abort"
+    if yes:
+        return "run"
+    if not sys.stdin.isatty():
+        warn("stdin is not a terminal; refusing to run without -y")
+        return "abort"
+    ans = read_line(f"{Ansi.bold('Run?')} [y/N/e] ")
+    if ans is None:
+        return "abort"
+    a = ans.strip().lower()
+    return "run" if a in ("y", "yes") else "edit" if a == "e" else "abort"
+
+
+# ---------------------------------------------------------------------------
+# running — stderr goes through a pty so we can keep its tail for the fix round
+# while the child still sees a terminal
+# ---------------------------------------------------------------------------
+def run_command(command: str, needs_sudo: bool, capture: bool) -> tuple[int, str]:
+    argv = ["bash", "-c", command]
+    if needs_sudo:
+        argv = (["sudo", "-A"] if os.environ.get("SUDO_ASKPASS") else ["sudo"]) + argv
+    if not capture:
+        try:
+            return subprocess.call(argv), ""
+        except KeyboardInterrupt:
+            print()
+            return 130, ""
+    tail: list[str] = []
+    try:
+        master, slave = os.openpty()
+    except OSError:
+        master = slave = -1
+    if master < 0:
+        p = subprocess.Popen(argv, stderr=subprocess.PIPE, text=True, errors="replace")
+        assert p.stderr is not None
+        for line in p.stderr:
+            sys.stderr.write(line); sys.stderr.flush()
+            tail.append(line.rstrip("\n")); del tail[:-STDERR_TAIL]
+        return p.wait(), "\n".join(tail)
+
+    def pump():
+        buf = b""
+        while True:
+            try:
+                chunk = os.read(master, 4096)
+            except OSError:
+                break
+            if not chunk:
+                break
+            os.write(2, chunk)
+            buf += chunk
+            *lines, buf = buf.split(b"\n")
+            tail.extend(l.decode(errors="replace").rstrip("\r") for l in lines)
+            del tail[:-STDERR_TAIL]
+        if buf:
+            tail.append(buf.decode(errors="replace")); del tail[:-STDERR_TAIL]
+
+    t = threading.Thread(target=pump, daemon=True)
+    t.start()
+    try:
+        p = subprocess.Popen(argv, stderr=slave)
+        os.close(slave)
+        rc = p.wait()
+    except KeyboardInterrupt:
+        print()
+        rc = 130
+    finally:
+        try:
+            os.close(master)
+        except OSError:
+            pass
+    t.join(timeout=1)
+    return rc, "\n".join(tail)
+
+
+def retry_query(original: str, command: str, rc: int, stderr: str) -> str:
+    return (f"The command you gave failed. Give a corrected command (same JSON schema) that still does what the "
+            f"ORIGINAL request asked — do not substitute a different action. If the failure means the request "
+            f"cannot be done from this directory/machine, return command \"\" and explain in notes.\n"
+            f"Original request: {original}\n"
+            f"Command run: {command}\n"
+            f"Exit code: {rc}\n"
+            f"stderr (last {STDERR_TAIL} lines):\n{stderr or '(nothing on stderr)'}")
+
+
+# ---------------------------------------------------------------------------
+# main
+# ---------------------------------------------------------------------------
+def main() -> int:
+    ap = argparse.ArgumentParser(
+        prog="clauderun",
+        description="Type a command badly (typos or plain language); Claude Haiku gives the real one, you confirm, it runs.",
+    )
+    ap.add_argument("query", nargs="+", help="the command you meant, typos and all, or a description")
+    ap.add_argument("-y", "--yes", action="store_true", help="skip y/N for safe/modifies commands (never for destructive)")
+    ap.add_argument("-n", "--dry-run", action="store_true", help="show the command, don't run it")
+    ap.add_argument("--no-retry", action="store_true", help="don't offer a fix when the command fails")
+    ap.add_argument("--no-cache", action="store_true", help="ignore and don't write the typo-fix cache")
+    ap.add_argument("--backend", choices=["auto", "cli", "api"], default="auto",
+                    help="auto = api if ANTHROPIC_API_KEY is set, else the claude CLI")
+    ap.add_argument("--model", help=f"model override (default: '{DEFAULT_MODEL_CLI}' for cli, '{DEFAULT_MODEL_API}' for api)")
+    ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument("--version", action="version", version=f"clauderun {VERSION}")
+    args = ap.parse_args()
+
+    query = " ".join(args.query).strip()
+    osd = detect_os()
+    backend = args.backend
+    if backend == "auto":
+        backend = "api" if os.environ.get("ANTHROPIC_API_KEY") else "cli"
+    model = args.model or (DEFAULT_MODEL_API if backend == "api" else DEFAULT_MODEL_CLI)
+
+    ctx = build_context(osd, query)
+    sp = system_prompt(ctx)
+    if args.verbose:
+        info(f"{ctx['os']} — cwd {ctx['cwd']} ({ctx['entries_total']} entries, branch {ctx['git_branch'] or '-'})")
+        info(f"present: {', '.join(ctx['present'])}" + (f" | missing: {', '.join(ctx['missing'])}" if ctx["missing"] else ""))
+
+    ckey = cache_key(osd, query)
+    data = None if args.no_cache else cache_get(ckey)
+    source = "cache" if data else backend
+    if data is None:
+        info(f"asking Claude ({backend}/{model}) …")
+        data = ask(backend, sp, query, model, args.verbose)
+        if data.get("kind") == "typo" and data.get("command") and not args.no_cache:
+            cache_put(ckey, {**data, "notes": ""})   # notes may mention cwd; the fix itself doesn't
+
+    attempt = 0
+    while True:
+        command = str(data.get("command") or "").strip()
+        if not command:
+            die(f"Claude could not turn that into a command. {data.get('notes') or ''}".strip())
+        command, had_sudo = strip_sudo(command)
+        needs_sudo = bool(data.get("needs_sudo")) or had_sudo
+
+        while True:
+            progs = programs_in(command)
+            if progs is None:
+                warn("command has unbalanced quotes — could not check which programs it calls")
+                missing: list[str] = []
+            else:
+                missing = progs[1]
+            ours, reasons = classify(command)
+            model_tier = data.get("danger", "modifies")
+            tier = max(ours, model_tier, key=TIERS.index)
+            if needs_sudo:
+                tier = max(tier, "modifies", key=TIERS.index)
+            if args.verbose and ours != model_tier:
+                info(f"danger: model said {model_tier}, our classifier said {ours} -> {tier}")
+            show_plan(command, data.get("explain", ""), tier, reasons, data.get("notes", ""),
+                      needs_sudo, missing, data.get("kind", "translate"), source)
+
+            if args.dry_run:
+                info("dry run, nothing executed")
+                return 0
+            if missing and args.yes:
+                warn("a program is missing; -y ignored")
+            choice = confirm(tier, args.yes and not missing)
+            if choice == "abort":
+                info("aborted")
+                return 130
+            if choice == "edit":
+                new = edit_line(command)
+                if new is None:
+                    info("aborted")
+                    return 130
+                command, had_sudo = strip_sudo(new)
+                needs_sudo = needs_sudo or had_sudo
+                data = {**data, "explain": "", "notes": "", "kind": "edited", "danger": "safe"}
+                source = ""
+                continue
+            break
+
+        can_retry = not args.no_retry and tier != "destructive" and attempt < MAX_RETRIES
+        print()
+        rc, err = run_command(command, needs_sudo, capture=can_retry)
+        if rc == 0:
+            return 0
+        warn(f"command exited with {rc}")
+        if not can_retry or rc == 130:
+            return rc
+        if not sys.stdin.isatty():
+            return rc
+        ans = read_line(f"{Ansi.bold('Ask Claude for a fix?')} [y/N] ")
+        if ans is None or ans.strip().lower() not in ("y", "yes"):
+            return rc
+        attempt += 1
+        info(f"asking Claude ({backend}/{model}) for a fix (round {attempt}/{MAX_RETRIES}) …")
+        data = ask(backend, sp, retry_query(query, command, rc, err), model, args.verbose)
+        source = f"{backend}, fix {attempt}"
+
+
+if __name__ == "__main__":
+    sys.exit(main())
