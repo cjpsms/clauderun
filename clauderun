@@ -242,6 +242,7 @@ Rules:
 - kind: "typo" when the input is essentially a real command with spelling/ordering mistakes (the fix does not depend on which files are in cwd). Otherwise "translate".
 - danger: "safe" = only reads/prints; "modifies" = creates or changes files, installs packages, git commits, starts services, sends network writes; "destructive" = deletes or overwrites data, force-push, reset --hard, disk/partition operations, kills processes, shutdown/reboot, anything not easily undone. When in doubt pick the higher tier.
 - If the user refers to "this file", "the video", etc., pick the matching entry from cwd. If several could match, pick the most likely and say so in notes.
+- If the input is already a valid command (typo-fixed or not) but a file it names is missing from cwd, STILL return the command and mention the missing file in notes — the user may know where it is.
 - If the request is not something a shell command can do, or is too ambiguous, set command to "" and explain why in notes."""
 
 
