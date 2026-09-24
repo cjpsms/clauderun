@@ -91,4 +91,4 @@ It is still an LLM writing shell: read the line before you press `y`.
 
 ## License
 
-MIT
+0BSD
